@@ -12,15 +12,16 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"encoding/xml"
+	"errors"
 	"fknsrs.biz/p/xml/c14n"
-	"fmt"
 	"github.com/beevik/etree"
-	"github.com/lestrrat-go/libxml2/parser"
-	"github.com/lestrrat-go/libxml2/types"
+	"github.com/op/go-logging"
 	"io"
 	"io/ioutil"
 	"strings"
 )
+
+var LOGGER = logging.MustGetLogger("xmldsig")
 
 /*
 The C14N library expect a WriteCloser type
@@ -38,203 +39,205 @@ func (XmlWriteCloser) Close() error {
 
 func newSignature() *Signature {
 	signature := &Signature{}
-	signature.SignedInfo.CanonicalizationMethod.Algorithm =
-		"http://www.w3.org/2001/10/xml-exc-c14n#"
+	signature.SignedInfo.CanonicalizationMethod.Algorithm = "http://www.w3.org/2001/10/xml-exc-c14n#"
 	transforms := &signature.SignedInfo.Reference.Transforms.Transform
 	*transforms = append(*transforms, Algorithm{"http://www.w3.org/2000/09/xmldsig#enveloped-signature"})
 	*transforms = append(*transforms, Algorithm{"http://www.w3.org/2001/10/xml-exc-c14n#"})
+	signature.SignedInfo.SignatureMethod.Algorithm = "http://www.w3.org/2009/xmldsig11#rsa-sha256"
+	signature.SignedInfo.Reference.DigestMethod.Algorithm = "http://www.w3.org/2001/04/xmlenc#sha256"
 	return signature
 }
 
-func CreateSignature(xmlString string) (string, error) {
+func generateSignatureTag(xml, publicKey string) (string, error) {
+	//Initialise the Signature object with properties, values are hard coded only support SHA-256
 	signature := newSignature()
-	signature.SignedInfo.SignatureMethod.Algorithm = "http://www.w3.org/2009/xmldsig11#rsa-sha256"
-	signature.SignedInfo.Reference.DigestMethod.Algorithm = "http://www.w3.org/2001/04/xmlenc#sha256"
-	// canonicalize the Item
 
-	c14nPayload := Canonicalise(xmlString)
-	fmt.Println("Canonicalise to be signed start")
-	fmt.Println(c14nPayload)
-	c14nPayloadDigest := GetSHA256Hash(c14nPayload)
-	fmt.Println("Canonicalise to be signed end")
+	//Canonicalise the original xml payload
+	canonicalisedPayload, err := Canonicalise(xml)
+	if err != nil {
+		return "", err
+	}
 
-	signature.SignedInfo.Reference.DigestValue = base64.StdEncoding.EncodeToString(c14nPayloadDigest)
+	//Get the digest of the Canonicalised payload
+	canonicalisedPayloadHashed, err := generateSHA256Hash(canonicalisedPayload)
+	if err != nil {
+		return "", err
+	}
 
-	// canonicalize the SignedInfo
-	sinnatureInfoXML, _ := EncodeToXMLString(signature.SignedInfo)
-	sinnatureInfoXMLC14N := Canonicalise(sinnatureInfoXML)
-	//fmt.Println("Signinfo: %s", sinnatureInfoXML)
-	//fmt.Println("Signinfo: %s", sinnatureInfoXMLC14N)
+	//Based64 encode the canonicalised hashed payload
+	canonicalisedPayloadHashedEncoded := base64.StdEncoding.EncodeToString(canonicalisedPayloadHashed)
+	//set the hash to the Signature struct
+	signature.SignedInfo.Reference.DigestValue = canonicalisedPayloadHashedEncoded
 
-	sig, _ := Sign(sinnatureInfoXMLC14N)
-	fmt.Println("xml to be singed start")
-	fmt.Println(sinnatureInfoXMLC14N)
-	fmt.Println("xml to be singed end")
-	//sig, err := s.Sign(canonData)
-	signature.SignatureValue = base64.StdEncoding.EncodeToString(sig)
-	x509Data := &X509Data{X509Certificate: "public key"}
+	//Now generate the SignedInfo tag by marshalling the struct to XML string
+	signedInfoString, err := marshallToXML(signature.SignedInfo)
+	if err != nil {
+		return "", err
+	}
+
+	//Canonicalise the SignedInfo
+	signedInfoStringCanonicalised, err := Canonicalise(signedInfoString)
+
+	signedInfoSignature, err := signSignedInfo(signedInfoStringCanonicalised)
+	if err != nil {
+		return "", err
+	}
+
+	//Populate the Sigature object with hashed signaure value
+	signature.SignatureValue = base64.StdEncoding.EncodeToString(signedInfoSignature)
+
+	//Populate the public key
+	x509Data := &X509Data{
+		X509Certificate: publicKey,
+	}
 	signature.KeyInfo.X509Data = x509Data
-	s, _ := EncodeToXMLString(signature)
-	//fmt.Println("Signature: %s", s)
+
+	//Generate the XML from Signature object
+	s, err := marshallToXML(signature)
+	if err != nil {
+		return "", err
+	}
 
 	return s, nil
 }
 
-func SignXML(xml string) string {
-	p := parser.New(parser.XMLParseDTDLoad | parser.XMLParseDTDAttr | parser.XMLParseNoEnt)
-	doc, err := p.ParseString(xml)
-	HandleError(err)
-	n, err := doc.DocumentElement()
-	nodeList, err := n.ChildNodes()
-
-	signature,err := CreateSignature(xml)
-	d, err := p.ParseString(signature)
-	dd, err := d.DocumentElement()
-	HandleError(err)
-	fmt.Println("Text content: %s", dd.TextContent())
-	for _, node := range nodeList {
-		if(node.NodeName() == "AppHdr"){
-			node.AddChild(dd)
-			break
-		}
+func SignXML(xml, publicKey string) (string, error) {
+	// Read the XML string and convert it to DOM object in memory
+	payloadDocument := etree.NewDocument()
+	err := payloadDocument.ReadFromString(xml)
+	if(err != nil){
+		return "", errors.New("Error while parsing XML into DOM")
 	}
 
-	return doc.String()
-}
+	signature, err := generateSignatureTag(xml, publicKey)
+	if(err != nil){
+		return "", err
+	}
 
-func SignXML2(xml string) string {
-	doc := etree.NewDocument()
-	doc.ReadFromString(xml)
+	//Create new XML node Signature
+	signatureDocument := etree.NewDocument()
+	signatureDocument.ReadFromString(signature)
 
-	signature, err := CreateSignature(xml)
-
-	HandleError(err)
-	doc2 := etree.NewDocument()
-	doc2.ReadFromString(signature)
-
-	for _, element := range doc.Root().ChildElements(){
-		fmt.Println(element.Tag)
+	//Add the signatureDocument under AppHdr tag
+	for _, element := range payloadDocument.Root().ChildElements(){
 		if(element.Tag == "AppHdr"){
-			element.AddChild(doc2.Root())
-		}
-	}
-	s, err := doc.WriteToString()
-	return s
-}
-
-func VerifySignature2(xml string)  {
-	p := parser.New(parser.XMLParseDTDLoad | parser.XMLParseDTDAttr | parser.XMLParseNoEnt)
-	doc, err := p.ParseString(xml)
-	HandleError(err)
-	rootNode, err := doc.DocumentElement()
-	appHeaderNode := GetNodeByTagName(rootNode, "AppHdr")
-	signatureNode := GetNodeByTagName(appHeaderNode, "Signature")
-	signInfoNode := GetNodeByTagName(signatureNode, "SignedInfo")
-	keyInfoNode := GetNodeByTagName(signatureNode, "KeyInfo")
-	x509DataNode := GetNodeByTagName(keyInfoNode, "X509Data")
-	x509CertificateNode := GetNodeByTagName(x509DataNode, "X509Certificate")
-	signatureValueNode := GetNodeByTagName(signatureNode, "SignatureValue")
-	referenceNode := GetNodeByTagName(signInfoNode, "Reference")
-	digentValueNode := GetNodeByTagName(referenceNode, "DigestValue")
-
-	err = appHeaderNode.RemoveChild(signatureNode)
-	fmt.Println("err: %s", err)
-	c14nPayload := Canonicalise(doc.String())
-	fmt.Println("Content to be verified start")
-	fmt.Println(c14nPayload)
-	fmt.Println("Content to be verified end")
-
-	c14nPayloadDigest := GetSHA256Hash(c14nPayload)
-	digestBase64 := base64.StdEncoding.EncodeToString(c14nPayloadDigest)
-	fmt.Println("digestBase64: %s", digestBase64)
-
-	publicKay := x509CertificateNode.TextContent()
-	digest := digentValueNode.TextContent()
-	signature := signatureValueNode.TextContent()
-
-	fmt.Println("publicKey: %s", publicKay)
-	fmt.Println("digest: %s", digest)
-	fmt.Println("signature: %s", signature)
-}
-
-func GetNodeByTagName(nodeElement types.Node, tagName string) types.Node {
-	nodes, _ := nodeElement.ChildNodes()
-	for _, element := range nodes{
-		if(element.NodeName() == tagName){
-			return element
+			element.AddChild(signatureDocument.Root())
 		}
 	}
 
-	return nil
+	//Return the Signed XML document as String
+	s, err := payloadDocument.WriteToString()
+	if(err != nil){
+		return "", err
+	}
+	return s, nil
 }
 
 func VerifySignature(xml string) bool {
-	doc := etree.NewDocument()
-	doc.ReadFromString(xml)
-	appHeaderElement := GetElementByName(doc.Root(), "AppHdr")
+	//Get the document object model
+	signedDocument := etree.NewDocument()
+	signedDocument.ReadFromString(xml)
+
+	//Get appheader node
+	appHeaderElement := GetElementByName(signedDocument.Root(), "AppHdr")
+
+	//Get Signature node
 	signatureElement := GetElementByName(appHeaderElement, "Signature")
+
+	//Get signinfo node
 	signInfoElement := GetElementByName(signatureElement, "SignedInfo")
+
+	//Get keyinfo node
 	keyInfoElement := GetElementByName(signatureElement, "KeyInfo")
+
+	//
 	x509DataElement := GetElementByName(keyInfoElement, "X509Data")
+
+	//
 	x509Certificate := GetElementByName(x509DataElement, "X509Certificate")
+
+	//
 	signatureValueElement := GetElementByName(signatureElement, "SignatureValue")
+
+	//
 	referenceElement := GetElementByName(signInfoElement, "Reference")
+
+	//
 	digentValueElement := GetElementByName(referenceElement, "DigestValue")
 
-
-	doc2 := etree.NewDocument()
-	doc2.AddChild(signInfoElement)
-	s1, _ := doc2.WriteToString()
-	signinfoCan := Canonicalise(s1)
-	fmt.Println("xml to be verified start")
-	fmt.Println(signinfoCan)
-	fmt.Println("xml to be verified start")
-
+	//Read the values
 	publicKay := x509Certificate.Text()
 	digest := digentValueElement.Text()
 	signature := signatureValueElement.Text()
 
+	//Conver the SignedInfo node to String to calculate the hash for verification
+	signedInfoDocument := etree.NewDocument()
+	signedInfoDocument.AddChild(signInfoElement)
+	signedInfoString, err := signedInfoDocument.WriteToString()
+	if(err != nil){
+		LOGGER.Errorf("Error occured while converting the SignedInfo node to String")
+		return false
+	}
+
+	//Canonicalise the signedinfo
+	signedInfoCanonicalisedString, err := Canonicalise(signedInfoString)
+
+	//Remove the Signature element from AppHdr
 	appHeaderElement.RemoveChild(signatureElement)
 
-	fmt.Println("publicKey: %s", publicKay)
-	fmt.Println("digest: %s", digest)
-	fmt.Println("signature: %s", signature)
+	payloadStringWithoutSignature, err := signedDocument.WriteToString()
+	if(err != nil){
+		LOGGER.Errorf("Error occured while converting the payload with removed sigature node to String")
+		return false
+	}
 
-	s, _ := doc.WriteToString()
-	fmt.Println("XML after removing signinfo start")
-	fmt.Println(s)
-	fmt.Println("XML after removing signinfo end")
+	payloadWithoutSignatureCanonicalised, err := Canonicalise(payloadStringWithoutSignature)
+	if(err != nil){
+		LOGGER.Errorf("Error occured while canonicalising the payloadStringWithoutSignature")
+		return false
+	}
 
-	c14nPayload := Canonicalise(s)
-	fmt.Println("Content to be verified start")
-	fmt.Println(c14nPayload)
-	fmt.Println("Content to be verified end")
+	payloadDigestWithoutSignature, err := generateSHA256Hash(payloadWithoutSignatureCanonicalised)
+	if(err != nil){
+		LOGGER.Errorf("Error occured while hashing the payloadStringWithoutSignature")
+		return false
+	}
 
-	c14nPayloadDigest := GetSHA256Hash(c14nPayload)
-	digestBase64 := base64.StdEncoding.EncodeToString(c14nPayloadDigest)
-	fmt.Println("digestBase64: %s", digestBase64)
+	payloadDigestWithoutSignatureBase64 := base64.StdEncoding.EncodeToString(payloadDigestWithoutSignature)
+	LOGGER.Infof("Calculated digest of payload XML: %s", payloadDigestWithoutSignatureBase64)
 
+	if(digest != payloadDigestWithoutSignatureBase64){
+		LOGGER.Warningf("Digest in document and digest calculated doesn't match")
+		return false
+	}
+
+	return doVerifySignatureUsingPEM(signature, signedInfoCanonicalisedString, publicKay)
+}
+
+func doVerifySignatureUsingPEM(signatureInPayload, signedInfoCanonicalisedString, publicKey string) bool {
 	a, _ := ioutil.ReadFile("certificate.pem")
 	block, _ := pem.Decode(a)
 	certificate, err := x509.ParseCertificate(block.Bytes)
 	rsaPublicKey := certificate.PublicKey.(*rsa.PublicKey)
 
-	signatureByte, err := base64.StdEncoding.DecodeString(signature)
+	signatureByte, err := base64.StdEncoding.DecodeString(signatureInPayload)
 	if err != nil {
-		fmt.Println("Signature decoding error",err)
 		return false
 	}
 
-	hash := GetSHA256Hash(signinfoCan)
-	fmt.Println("checksum to verify:", base64.StdEncoding.EncodeToString(hash))
-	err = rsa.VerifyPKCS1v15(rsaPublicKey, crypto.SHA256, hash[:], signatureByte)
+	hash, err := generateSHA256Hash(signedInfoCanonicalisedString)
 	if err != nil {
-		fmt.Println(err)
-	}else{
-		fmt.Println("Validated successfully")
+		return false
 	}
 
-	return true
+	err = rsa.VerifyPKCS1v15(rsaPublicKey, crypto.SHA256, hash[:], signatureByte)
+	if err != nil {
+		LOGGER.Warningf("Signature verification failed. %s", err)
+		return false
+	}else{
+		LOGGER.Infof("Signature verification success")
+		return true
+	}
 }
 
 func GetElementByName(element *etree.Element, tag string) *etree.Element  {
@@ -247,83 +250,76 @@ func GetElementByName(element *etree.Element, tag string) *etree.Element  {
 	return nil
 }
 
-func Canonicalise(xmlString string) string {
+/*
+Canonicalise the XML based on W3C standard, using another library
+ */
+func Canonicalise(xmlString string) (string, error) {
 	decoder := xml.NewDecoder(strings.NewReader(xmlString))
 	buf := bytes.NewBufferString("")
+
+	//The library expect a WriteCloser, so create a type to implement the Close method
 	xmlWriter := XmlWriteCloser{buf}
-	c14n.Canonicalise(decoder, xmlWriter, true)
+	err := c14n.Canonicalise(decoder, xmlWriter, true)
+	if(err != nil){
+		LOGGER.Infof("Error occured while canonicalising the XML payload. %s", err)
+		return "", err
+	}
 
-	return buf.String()
+	return buf.String(), nil
 }
 
-func GetSHA256Hash(val string) []byte {
+func generateSHA256Hash(val string) ([]byte, error) {
 	hash := sha256.New()
-	hash.Write([]byte(val))
+	_, err := hash.Write([]byte(val))
+	if(err != nil){
+		LOGGER.Infof("Error occured while calculating the digest. %s", err)
+		return nil, err
+	}
 	checksum := hash.Sum(nil)
-	//digest := base64.StdEncoding.EncodeToString(checksum)
-	return checksum
+	return checksum, nil
 }
 
-func EncodeToXMLString(data interface{}) (string, error) {
+func marshallToXML(data interface{}) (string, error) {
 	var buffer bytes.Buffer
 	writer := bufio.NewWriter(&buffer)
 	encoder := xml.NewEncoder(writer)
 	err := encoder.Encode(data)
 	if err != nil {
+		LOGGER.Infof("Error occured while marshalling the SignedInfo tag to XML. %s", err)
 		return "", err
 	}
-	encoder.Flush()
-	return buffer.String(),nil
-}
-
-func UnmarshallSignatureTag(val string) Signature {
-	signature := Signature{}
-	err := xml.Unmarshal([]byte(val), &signature)
-	HandleError(err)
-
-	return signature
+	err = encoder.Flush()
+	if err != nil {
+		LOGGER.Infof("Error occured while Flush. %s", err)
+		return "", err
+	}
+	return buffer.String(), nil
 }
 
 /*
 Messaged will be hashed and signed
  */
-func Sign(data string) ([]byte, error) {
-	cert, err := tls.LoadX509KeyPair("certificate.pem", "key.pem")
-	HandleError(err)
-	signer := cert.PrivateKey.(crypto.Signer)
-	checkSumToSign := GetSHA256Hash(data)
-	fmt.Println("checksum to sign:", base64.StdEncoding.EncodeToString(checkSumToSign))
-	signature, err := signer.Sign(rand.Reader, checkSumToSign, crypto.SHA256)
-	HandleError(err)
-	return signature, nil
+func signSignedInfo(data string) ([]byte, error) {
+	//Signing has to sign the hash of the SignedInfo
+	checkSumToSign, err := generateSHA256Hash(data)
+	if(err != nil){
+		return nil, err
+	}
+
+	return doSignUsingPEM(checkSumToSign)
 }
 
-/*func Verify(digest string, signature string) bool {
-	content, err := ioutil.ReadFile("certificate.pem")
-	HandleError(err)
-	block, _ := pem.Decode([]byte(content))
-	if block == nil {
-		return false
-	}
-
-	key, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return false
-	}
-
-	pubKey := key.(*rsa.PublicKey)
-
-	signatureByte, err := base64.StdEncoding.DecodeString(signature)
-	if err != nil {
-		return false
-	}
-}*/
-
-func HandleError(err error)  {
+func doSignUsingPEM(data []byte) ([]byte, error) {
+	//This is using the Self signed pem files, has to use HSM here
+	cert, _ := tls.LoadX509KeyPair("certificate.pem", "key.pem")
+	signer := cert.PrivateKey.(crypto.Signer)
+	signature, err := signer.Sign(rand.Reader, data, crypto.SHA256)
 	if(err != nil){
-		fmt.Println("Error: %v", err)
-		return
+		LOGGER.Errorf("Error occured while signing using PEM files. %s", err)
+		return nil, err
 	}
+
+	return signature, nil
 }
 
 // Signature element is the root element of an XML Signature.

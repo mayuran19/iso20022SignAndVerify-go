@@ -137,12 +137,11 @@ func main() {
 				</FICdtTrf>
 			</Message>`
 
-	for i := 1; i <= 1; i++ {
-		signedXML := xmldsig.SignXML2(toBeSigned)
-		fmt.Println("Signed XML start")
-		fmt.Println(signedXML)
-		fmt.Println("Signed XML end")
-
+	for i := 1; i <= 100; i++ {
+		signedXML, err := xmldsig.SignXML(toBeSigned, "Public key")
+		if(err != nil){
+			fmt.Println(err)
+		}
 		xmldsig.VerifySignature(signedXML)
 	}
 }
